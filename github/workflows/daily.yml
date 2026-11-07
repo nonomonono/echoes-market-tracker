@@ -1,0 +1,39 @@
+name: Actualizar histórico de precios Echoes
+
+on:
+  schedule:
+    # Dos disparos UTC; el script solo trabaja cuando son las 08:00 en Europe/Berlin.
+    - cron: "0 6,7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Configurar rclone
+        env:
+          RCLONE_CONFIG_B64: ${{ secrets.RCLONE_CONFIG_B64 }}
+        run: |
+          mkdir -p "$HOME/.config/rclone"
+          echo "$RCLONE_CONFIG_B64" | base64 --decode > "$HOME/.config/rclone/rclone.conf"
+          chmod 600 "$HOME/.config/rclone/rclone.conf"
+
+      - name: Consultar API y actualizar Excel en OneDrive
+        env:
+          RCLONE_REMOTE: ${{ vars.RCLONE_REMOTE }}
+        run: python update_prices.py
