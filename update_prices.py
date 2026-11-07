@@ -12,7 +12,7 @@ from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 API_URL = "https://echoes.mobi/api/v1/prices"
-TYPE_IDS = [42001000000, 42001000001, 42001000002, 42001000003, 42001000004, 42001000005, 42001000006, 42001000007, 42001000008, 42001000009, 42001000010, 42001000011, 42001000018, 42001000019, 42001000020, 42001000021, 42001000022, 42001000023, 42001000024, 42001000025, 42001000026, 42001000027, 42001000028, 42001000029, 42001000030, 42001000031, 42001000032, 42001000033, 42001000012, 42001000013, 42001000014, 42001000015, 42001000016, 42001000017]
+TYPE_IDS = [42001000000, 42001000001, 42001000002, 42001000003, 42001000004, 42001000005, 42001000006, 42001000007, 42001000008, 42001000009, 42001000010, 42001000011, 42001000018, 42001000019, 42001000020, 42001000021, 42001000022, 42001000023, 42001000024, 42001000025, 42001000026, 42001000027, 42001000028, 42001000029, 42001000030, 42001000031, 42001000032, 42001000033, 42002000012, 42002000013, 42002000014, 42002000015, 42002000016, 42002000017]
 TIMEZONE = ZoneInfo("Europe/Berlin")
 WORKBOOK = "Echoes_Market_History.xlsx"
 
@@ -20,36 +20,72 @@ def run_rclone(*args, check=True):
     subprocess.run(["rclone", *args], check=check)
 
 def fetch_prices():
-    params = {
-        "lang": "en",
-        "type_ids": ",".join(map(str, TYPE_IDS)),
-        "page": 1,
-        "page_size": 50,
-    }
-    response = requests.get(API_URL, params=params, timeout=60)
-    response.raise_for_status()
-    payload = response.json()
-    results = payload.get("results")
-    if not isinstance(results, list) or not results:
-        raise RuntimeError("La API no devolvió una lista de resultados válida.")
-    rows = []
+    """Consulta conjunta y reintento individual para cada identificador ausente."""
+    def request_ids(ids):
+        params = {
+            "lang": "en",
+            "type_ids": ",".join(map(str, ids)),
+            "page": 1,
+            "page_size": 50,
+        }
+        response = requests.get(API_URL, params=params, timeout=60)
+        response.raise_for_status()
+        payload = response.json()
+        results = payload.get("results")
+        if not isinstance(results, list):
+            raise RuntimeError("La API no devolvió una lista de resultados válida.")
+        return payload, results
+
+    payload, results = request_ids(TYPE_IDS)
+    requested = set(TYPE_IDS)
+    items_by_id = {}
     for item in results:
+        type_id = int(item["type_id"])
+        if type_id not in requested:
+            raise RuntimeError(f"La API devolvió un ID no solicitado: {type_id}")
+        if type_id in items_by_id:
+            raise RuntimeError(f"La API devolvió un ID duplicado: {type_id}")
+        items_by_id[type_id] = (item, payload)
+
+    missing = [type_id for type_id in TYPE_IDS if type_id not in items_by_id]
+    print(f"Consulta conjunta: {len(items_by_id)} de {len(TYPE_IDS)}; "
+          f"reintentando individualmente {len(missing)} identificadores.")
+    for type_id in missing:
+        try:
+            individual_payload, individual_results = request_ids([type_id])
+            matches = [item for item in individual_results if int(item["type_id"]) == type_id]
+            if len(matches) > 1:
+                raise RuntimeError(f"La consulta individual devolvió duplicados para {type_id}")
+            if matches:
+                items_by_id[type_id] = (matches[0], individual_payload)
+                print(f"Recuperado individualmente: {type_id}")
+            else:
+                print(f"Sin datos de API: {type_id}")
+        except (requests.RequestException, ValueError, KeyError, RuntimeError) as exc:
+            # No se inventan precios: queda registrado en Missing_Items y se reintenta mañana.
+            print(f"No se pudo recuperar {type_id}: {exc}")
+
+    if not items_by_id:
+        raise RuntimeError("La API no devolvió ningún producto; no se modificará el Excel.")
+
+    captured_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    rows = []
+    for type_id in TYPE_IDS:
+        if type_id not in items_by_id:
+            continue
+        item, source_payload = items_by_id[type_id]
         rows.append({
-            "prices_as_of": item.get("prices_as_of") or payload.get("prices_as_of"),
-            "base_prices_version": item.get("base_prices_version") or payload.get("base_prices_version"),
-            "type_id": int(item["type_id"]),
+            "prices_as_of": item.get("prices_as_of") or source_payload.get("prices_as_of"),
+            "base_prices_version": item.get("base_prices_version") or source_payload.get("base_prices_version"),
+            "type_id": type_id,
             "name": item.get("name"),
             "avg": item.get("avg"),
             "avg_no_outliers": item.get("avg_no_outliers"),
             "base_price": item.get("base_price"),
-            "captured_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "captured_at_utc": captured_at,
         })
     df = pd.DataFrame(rows)
-    unexpected = set(df["type_id"]) - set(TYPE_IDS)
-    if unexpected:
-        raise RuntimeError(f"La API devolvió identificadores no solicitados: {sorted(unexpected)}")
-    if df["type_id"].duplicated().any():
-        raise RuntimeError("La API devolvió type_id duplicados.")
+    print(f"Total recuperado: {len(df)} de {len(TYPE_IDS)} productos.")
     return df, payload
 
 def update_workbook(new_df, payload, path):
