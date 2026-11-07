@@ -45,6 +45,9 @@ def fetch_prices():
             "captured_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         })
     df = pd.DataFrame(rows)
+    unexpected = set(df["type_id"]) - set(TYPE_IDS)
+    if unexpected:
+        raise RuntimeError(f"La API devolvió identificadores no solicitados: {sorted(unexpected)}")
     if df["type_id"].duplicated().any():
         raise RuntimeError("La API devolvió type_id duplicados.")
     return df, payload
@@ -64,6 +67,24 @@ def update_workbook(new_df, payload, path):
         combined["type_id"] = pd.to_numeric(combined["type_id"], errors="coerce").astype("Int64")
         combined = combined.drop_duplicates(subset=["prices_as_of", "type_id"], keep="last")
         combined = combined.sort_values(["prices_as_of", "name", "type_id"], na_position="last")
+
+    # Control de cobertura: mostrar los IDs no devueltos sin crear precios ficticios.
+    received_ids = set(new_df["type_id"].astype(int))
+    missing_ids = [type_id for type_id in TYPE_IDS if type_id not in received_ids]
+    known_names = {}
+    if not combined.empty and "type_id" in combined.columns and "name" in combined.columns:
+        for _, record in combined.dropna(subset=["type_id"]).iterrows():
+            if pd.notna(record.get("name")):
+                known_names[int(record["type_id"])] = str(record["name"])
+    missing = pd.DataFrame([{
+        "type_id": type_id,
+        "last_known_name": known_names.get(type_id, ""),
+        "status": "Sin datos de API",
+        "prices_as_of": payload.get("prices_as_of"),
+        "checked_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    } for type_id in missing_ids], columns=[
+        "type_id", "last_known_name", "status", "prices_as_of", "checked_at_utc"
+    ])
 
     latest = new_df.copy()
     latest["prices_as_of"] = pd.to_datetime(latest["prices_as_of"], utc=True, errors="coerce")
@@ -97,12 +118,16 @@ def update_workbook(new_df, payload, path):
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         combined.to_excel(writer, sheet_name="Historical_Data", index=False)
         latest.to_excel(writer, sheet_name="Latest_Prices", index=False)
+        missing.to_excel(writer, sheet_name="Missing_Items", index=False)
         analysis.to_excel(writer, sheet_name="Price_Analysis", index=False)
         pd.DataFrame([{
             "last_successful_update_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "prices_as_of": payload.get("prices_as_of"),
             "base_prices_version": payload.get("base_prices_version"),
+            "products_requested": len(TYPE_IDS),
             "products_returned": len(new_df),
+            "products_missing": len(missing_ids),
+            "missing_type_ids": ", ".join(map(str, missing_ids)),
         }]).to_excel(writer, sheet_name="Run_Info", index=False)
 
     wb = load_workbook(path)
@@ -122,6 +147,9 @@ def update_workbook(new_df, payload, path):
     dash["A1"].font = Font(bold=True, size=16, color="244062")
     dash["A3"] = "El gráfico utiliza avg_no_outliers del histórico diario."
     dash["A4"] = "Para ver un producto, filtra Historical_Data por name o type_id."
+    dash["A5"] = f"Cobertura API: {len(new_df)} de {len(TYPE_IDS)} productos; {len(missing_ids)} sin datos."
+    dash["A5"].font = Font(bold=True, color="244062")
+    dash["A6"] = "Consulta la hoja Missing_Items para identificar los productos ausentes."
     # Crear un gráfico de ejemplo para el primer producto con datos históricos.
     if not combined.empty:
         first_id = int(combined.iloc[0]["type_id"])
@@ -129,22 +157,22 @@ def update_workbook(new_df, payload, path):
         series["avg_no_outliers"] = pd.to_numeric(series["avg_no_outliers"], errors="coerce")
         series = series.dropna(subset=["avg_no_outliers"]).tail(100)
         if len(series) >= 2:
-            dash["A6"] = "Fecha de precios"
-            dash["B6"] = f"{series.iloc[-1]['name']} — avg_no_outliers"
-            for idx, (_, row) in enumerate(series.iterrows(), start=7):
+            dash["A8"] = "Fecha de precios"
+            dash["B8"] = f"{series.iloc[-1]['name']} — avg_no_outliers"
+            for idx, (_, row) in enumerate(series.iterrows(), start=9):
                 dash.cell(idx, 1, str(row["prices_as_of"]))
                 dash.cell(idx, 2, float(row["avg_no_outliers"]))
             chart = LineChart()
             chart.title = f"Precio sin atípicos — {series.iloc[-1]['name']}"
             chart.y_axis.title = "Precio"
             chart.x_axis.title = "Fecha del snapshot"
-            data = Reference(dash, min_col=2, min_row=6, max_row=6 + len(series))
-            cats = Reference(dash, min_col=1, min_row=7, max_row=6 + len(series))
+            data = Reference(dash, min_col=2, min_row=8, max_row=8 + len(series))
+            cats = Reference(dash, min_col=1, min_row=9, max_row=8 + len(series))
             chart.add_data(data, titles_from_data=True)
             chart.set_categories(cats)
             chart.height = 9
             chart.width = 20
-            dash.add_chart(chart, "D6")
+            dash.add_chart(chart, "D8")
     wb.save(path)
 
 def main():
@@ -170,7 +198,8 @@ def main():
         new_df, payload = fetch_prices()
         update_workbook(new_df, payload, path)
         run_rclone("copyto", str(path), remote_file)
-        print(f"Actualización completada: {len(new_df)} productos; snapshot {payload.get('prices_as_of')}.")
+        print(f"Actualización completada: {len(new_df)} de {len(TYPE_IDS)} productos; "
+              f"faltan {len(TYPE_IDS) - len(new_df)}; snapshot {payload.get('prices_as_of')}.")
 
 if __name__ == "__main__":
     main()
